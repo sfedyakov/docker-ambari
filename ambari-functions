@@ -10,7 +10,7 @@ USAGE
 : ${AMBARI_SERVER_NAME:=${NODE_PREFIX}-server}
 : ${AMBARI_SERVER_IMAGE:="hortonworks/ambari-server:latest"}
 : ${AMBARI_AGENT_IMAGE:="hortonworks/ambari-agent:latest"}
-: ${DOCKER_OPTS:=""}
+: ${DOCKER_OPTS:="--net=appnet"}
 : ${CONSUL:="${NODE_PREFIX}-consul"}
 : ${CONSUL_IMAGE:="sequenceiq/consul:v0.5.0-v6"}
 : ${CLUSTER_SIZE:=3}
@@ -45,7 +45,7 @@ get-consul-ip() {
 
 get-host-ip() {
   HOST=$1
-  docker inspect --format="{{.NetworkSettings.IPAddress}}" ${HOST}
+  docker inspect --format="{{.NetworkSettings.Networks.appnet.IPAddress}}" ${HOST}
 }
 
 amb-members() {
@@ -97,8 +97,8 @@ _amb_run_shell() {
   COMMAND=$1
   : ${COMMAND:? required}
   get-ambari-server-ip
-  EXPECTED_HOST_COUNT=$(docker inspect --format="{{.Config.Image}} {{.Name}}" $(docker ps -q)|grep $AMBARI_AGENT_IMAGE|grep $NODE_PREFIX|wc -l|xargs)
-  run-command docker run -it --rm -e EXPECTED_HOST_COUNT=$EXPECTED_HOST_COUNT -e BLUEPRINT=$BLUEPRINT --link ${AMBARI_SERVER_NAME}:ambariserver \
+  EXPECTED_HOST_COUNT=$(docker inspect --format="{{.Config.Image}}%20{{.Name}}" $(docker ps -q)|sed 's/%20/ /'|grep $AMBARI_AGENT_IMAGE|grep $NODE_PREFIX|wc -l|xargs)
+  run-command docker run -it --rm $DOCKER_OPTS -e AMBARI_HOST=$AMBARI_SERVER_IP -e EXPECTED_HOST_COUNT=$EXPECTED_HOST_COUNT -e BLUEPRINT=$BLUEPRINT --link ${AMBARI_SERVER_NAME}:ambariserver \
      --entrypoint /bin/sh $AMBARI_SERVER_IMAGE -c $COMMAND
 }
 
@@ -127,10 +127,10 @@ amb-start-first() {
   if [[ "$EXPOSE_DNS" == "true" ]]; then
      dns_port_command="-p 53:$DNS_PORT/udp"
   fi
-  run-command docker run -d $dns_port_command --name $CONSUL -h $CONSUL.service.consul $CONSUL_IMAGE -server -bootstrap
+  run-command docker run -d $DOCKER_OPTS $dns_port_command --name $CONSUL -h $CONSUL.service.consul $CONSUL_IMAGE -server -bootstrap
   sleep 5
 
-  run-command docker run -d $DOCKER_OPTS --privileged --name $AMBARI_SERVER_NAME -h $AMBARI_SERVER_NAME.service.consul $AMBARI_SERVER_IMAGE \
+  run-command docker run -d $DOCKER_OPTS -p 8080:8080/tcp --privileged --name $AMBARI_SERVER_NAME -h $AMBARI_SERVER_NAME.service.consul $AMBARI_SERVER_IMAGE \
           systemd.setenv=NAMESERVER_ADDR=$(get-consul-ip)
 
   get-ambari-server-ip
@@ -147,20 +147,20 @@ amb-copy-to-hdfs() {
   amb-create-hdfs-dir $DIR
   DATANODE=$(curl -si -X PUT "http://$AMBARI_SERVER_IP:50070/webhdfs/v1$DIR/$FILE_NAME?user.name=hdfs&op=CREATE" |grep Location | sed "s/\..*//; s@.*http://@@")
   DATANODE_IP=$(get-host-ip $DATANODE)
-  curl -T $FILE_PATH "http://$DATANODE_IP:50075/webhdfs/v1$DIR/$FILE_NAME?op=CREATE&user.name=hdfs&overwrite=true&namenoderpcaddress=$AMBARI_SERVER_IP:8020"
+  run-command curl -T $FILE_PATH "http://$DATANODE_IP:50075/webhdfs/v1$DIR/$FILE_NAME?op=CREATE&user.name=hdfs&overwrite=true&namenoderpcaddress=$AMBARI_SERVER_IP:8020"
 }
 
 amb-create-hdfs-dir() {
   get-ambari-server-ip
   DIR=$1
-  curl -X PUT "http://$AMBARI_SERVER_IP:50070/webhdfs/v1$DIR?user.name=hdfs&op=MKDIRS" > /dev/null 2>&1
+  run-command curl -X PUT "http://$AMBARI_SERVER_IP:50070/webhdfs/v1$DIR?user.name=hdfs&op=MKDIRS" > /dev/null 2>&1
 }
 
 amb-scp-to-first() {
   get-ambari-server-ip
   FILE_PATH=${1:?"usage: <FILE_PATH> <DESTINATION_PATH>"}
   DEST_PATH=${2:?"usage: <FILE_PATH> <DESTINATION_PATH>"}
-  scp $FILE_PATH root@$AMBARI_SERVER_IP:$DEST_PATH
+  run-command scp $FILE_PATH root@$AMBARI_SERVER_IP:$DEST_PATH
 }
 
 amb-start-node() {
@@ -181,11 +181,9 @@ amb-start-node() {
 }
 
 _consul-register-service() {
-  curl -X PUT -d "{
-    \"Node\": \"$1\",
-    \"Address\": \"$2\",
-    \"Service\": {
-      \"Service\": \"$1\"
-    }
-  }" http://$(get-consul-ip):8500/v1/catalog/register
+  echo curl -X PUT -d \'{    \"Node\": \"$1\",    \"Address\": \"$2\",    \"Service\": {      \"Service\": \"$1\"    }  }\' http://$(get-consul-ip):8500/v1/catalog/register > runcmd
+  echo >> runcmd
+  run-command docker cp runcmd $AMBARI_SERVER_NAME:/root/runcmd
+  run-command docker exec -it amb-server sh -c /root/runcmd
+  rm -f runcmd
 }
